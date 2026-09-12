@@ -1,0 +1,170 @@
+import streamlit as st
+import requests
+import google.generativeai as genai
+
+class AtrinovaScoutEngine:
+    def __init__(self):
+        self.swisstopo_api = "https://api3.geo.admin.ch/rest/services/api/SearchServer"
+        
+    def get_coordinates(self, address_string):
+        params = {
+            'searchText': address_string, 
+            'type': 'locations', 
+            'origins': 'address',
+            'sr': '2056' 
+        }
+        response = requests.get(self.swisstopo_api, params=params)
+        data = response.json()
+        if data.get('results'):
+            best_match = data['results'][0]
+            # Koordinaten runden
+            y = int(float(best_match['attrs']['y']))
+            x = int(float(best_match['attrs']['x']))
+            return y, x
+        raise ValueError("Adresse nicht gefunden.")
+
+    def get_parcel_data(self, y, x):
+        # SCHRITT 1: Die offizielle Grundstücks-ID (EGRID) über die Koordinaten abfragen
+        egrid_url = f"https://oereb.geo.bl.ch/getegrid/json/?EN={y},{x}"
+        response = requests.get(egrid_url)
+        response.raise_for_status()
+        egrid_data = response.json()
+        
+        egrid = None
+        responses = egrid_data.get('GetEGRIDResponse', [])
+        if isinstance(responses, list) and len(responses) > 0:
+            egrid = responses[0].get('egrid')
+        elif isinstance(responses, dict):
+            egrid = responses.get('egrid')
+            
+        if not egrid:
+            raise ValueError(f"Keine EGRID für Koordinaten {y},{x} gefunden.")
+
+        # SCHRITT 2: Den echten Katasterauszug mit der EGRID abrufen
+        oereb_url = f"https://oereb.geo.bl.ch/extract/json/?EGRID={egrid}"
+        response = requests.get(oereb_url)
+        response.raise_for_status()
+        data = response.json()
+        
+        real_estate = data.get('GetExtractByIdResponse', {}).get('extract', {}).get('RealEstate', {})
+        flaeche = real_estate.get('LandRegistryArea', 0)
+        gemeinde = real_estate.get('MunicipalityName', 'Unbekannt')
+        
+        zone_name = "Unbekannt"
+        for restriction in real_estate.get('RestrictionOnLandownership', []):
+            if restriction.get('Theme', {}).get('Code') == 'ch.Nutzungsplanung':
+                zone_name = restriction.get('Information', {}).get('Text', 'Unbekannt')
+                break
+                
+        return {
+            "flaeche_m2": flaeche, 
+            "zone": zone_name,
+            "gemeinde": gemeinde,
+            "ausnuetzungsziffer": 0.45 
+        }
+
+    def generate_prompt(self, parcel, price):
+        return f"""Du agierst als Senior Immobilienprojektentwickler für die Atrinova Invest AG in der Schweiz. Antworte hochstrukturiert und nutze saubere Markdown-Tabellen.
+
+### 1. INPUT-DATEN
+* Grundstücksfläche: {parcel['flaeche_m2']} m²
+* Kaufpreis Liegenschaft/Land: {price} CHF
+* Ausnützungsziffer (AZ): {parcel['ausnuetzungsziffer']}
+* Zone: {parcel['zone']}
+* Standort: {parcel['gemeinde']} (Region Basel)
+
+### 2. ARCHITEKTURSTUDIE & POTENZIALANALYSE (SIA 416)
+1. Berechne max. BGF = Fläche * AZ.
+2. Berechne HNF = ca. 75% der BGF.
+3. Bewerte aufgrund der HNF und Zone ({parcel['zone']}), was wirtschaftlich am sinnvollsten ist:
+   * Option A: Mehrfamilienhaus (MFH).
+   * Option B: Reiheneinfamilienhäuser (REFH).
+   * Option C: Einfamilienhäuser (EFH).
+Lege dich begründet auf das profitabelste Szenario fest.
+
+### 3. PROJEKTDEFINITION & MIX
+* Definiere den genauen Einheiten-Mix mit den dazugehörigen HNF-Flächen.
+* SYSTEM-REGEL: Falls ein Mehrfamilienhaus (MFH) vorgeschlagen wird, MUSS das Dachgeschoss zwingend als die billigste Einheit (absolut und CHF/m²) kalkuliert werden. 
+
+### 4. BKP KOSTENSCHÄTZUNG (PREMIUM-STANDARD)
+* BKP 0: {price} CHF
+* BKP 1: 5% von BKP 2
+* BKP 2: Premium-Richtwert (4'000 - 4'200 CHF/m² BGF für MFH; passe leicht an falls REFH/EFH)
+* BKP 4: 7% von BKP 2
+* BKP 5: 16% von (BKP 1-4)
+
+### 5. VERKAUFSERLÖSE (PREMIUMSEGMENT)
+* Nutze Spitzenwerte für Neubauten im Premiumsegment in {parcel['gemeinde']}.
+* Kalkuliere transparent mit 16'000 bis 18'500 CHF/m² HNF je nach Typ (Garten, Attika etc.).
+
+### 6. WIRTSCHAFTLICHKEIT
+Erstelle eine tabellarische Zusammenfassung (Total Anlagekosten, Total Erlös, Projektgewinn in CHF, Marge in %).
+Gib ein klares "GO" oder "NO-GO" aus Investorensicht (Zielmarge: >15%).
+"""
+
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="Atrinova AI-Scout", page_icon="🏗️", layout="wide")
+
+st.title("🏗️ Atrinova AI-Scout")
+st.subheader("Automatisierte Grundstücksevaluation & Machbarkeitsstudie")
+
+# Sidebar für Einstellungen
+st.sidebar.header("⚙️ Einstellungen")
+api_key = st.sidebar.text_input("Gemini API-Key", type="password", help="Dein Schlüssel von Google AI Studio")
+st.sidebar.markdown("---")
+st.sidebar.markdown("💡 **Atrinova System-Regeln aktiv:**")
+st.sidebar.markdown("- Dynamische Typologie-Empfehlung")
+st.sidebar.markdown("- Falls MFH: DG = Günstigste Wohnung")
+st.sidebar.markdown("- Premium-Standard Kalkulation")
+
+# Eingabefelder im Hauptbereich
+col1, col2 = st.columns(2)
+with col1:
+    address_input = st.text_input("Grundstücksadresse", value="Im Gerstenacker 1, 4102 Binningen")
+with col2:
+    price_input = st.number_input("Kaufpreis (CHF)", value=5100000, step=100000)
+
+if st.button("Projekt evaluieren & berechnen", type="primary"):
+    if not api_key:
+        st.warning("⚠️ Bitte gib deinen Gemini API-Key in der Seitenleiste ein, um die Berechnung auszuführen.")
+    else:
+        engine = AtrinovaScoutEngine()
+        
+        with st.spinner("1. Lade Grundstücksdaten (Swisstopo & ÖREB-Kataster)..."):
+            try:
+                y, x = engine.get_coordinates(address_input)
+                parcel_data = engine.get_parcel_data(y, x)
+                final_prompt = engine.generate_prompt(parcel_data, price_input)
+            except Exception as e:
+                st.error(f"Fehler bei der Geodaten-Abfrage: {e}")
+                st.stop()
+        
+        st.success(f"✓ Geodaten für Parzelle in {parcel_data['gemeinde']} erfolgreich geladen!")
+        
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Fläche", f"{parcel_data['flaeche_m2']} m²")
+        m2.metric("Zone", parcel_data['zone'])
+        m3.metric("AZ", parcel_data['ausnuetzungsziffer'])
+        
+        st.divider() 
+        
+        with st.spinner("2. Atrinova KI (Gemini) ermittelt Bestnutzung & Wirtschaftlichkeit..."):
+            try:
+                genai.configure(api_key=api_key)
+                
+                # KORREKTUR: Direktes Verwenden des von Google empfohlenen aktuellen Modells
+                model = genai.GenerativeModel('gemini-3.6-flash')
+                
+                response = model.generate_content(final_prompt)
+                
+                st.markdown("### 📊 Resultat der Machbarkeitsstudie")
+                st.markdown(response.text)
+                
+            except Exception as e:
+                st.error(f"Fehler bei der KI-Generierung: {e}")
+
+                            
+
+streamlit
+requests
+google-generativeai
